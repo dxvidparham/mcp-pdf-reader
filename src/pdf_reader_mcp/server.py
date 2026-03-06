@@ -1,22 +1,41 @@
 import asyncio
-import os
-import tempfile
-from pathlib import Path
-from typing import Dict, List, Optional
 import base64
+import os
+from pathlib import Path
+from typing import Dict
 
-from mcp.server.models import InitializationOptions
+import mcp.server.stdio
 import mcp.types as types
 from mcp.server import NotificationOptions, Server
-from pydantic import AnyUrl, Field
-import mcp.server.stdio
-import PyPDF2
+from mcp.server.models import InitializationOptions
+from pdf_oxide import PdfDocument
+from pydantic import AnyUrl
 
 # Store opened PDF documents
-pdfs: Dict[str, PyPDF2.PdfReader] = {}
+pdfs: Dict[str, PdfDocument] = {}
 pdf_paths: Dict[str, str] = {}  # Map of PDF IDs to their file paths
 
 server = Server("pdf-reader-mcp")
+
+
+def _get_metadata(doc: PdfDocument) -> dict:
+    """Extract metadata from a PdfDocument, returning a plain dict of strings."""
+    metadata = {}
+    try:
+        metadata["version"] = ".".join(str(v) for v in doc.version())
+        metadata["pages"] = str(doc.page_count())
+    except Exception:
+        pass
+    try:
+        xmp = doc.xmp_metadata()
+        if xmp:
+            for key, value in xmp.items():
+                if value is not None:
+                    metadata[str(key)] = str(value)
+    except Exception:
+        pass
+    return metadata
+
 
 @server.list_resources()
 async def handle_list_resources() -> list[types.Resource]:
@@ -33,6 +52,7 @@ async def handle_list_resources() -> list[types.Resource]:
         )
         for pdf_id, path in pdf_paths.items()
     ]
+
 
 @server.read_resource()
 async def handle_read_resource(uri: AnyUrl) -> str:
@@ -52,6 +72,7 @@ async def handle_read_resource(uri: AnyUrl) -> str:
             return base64.b64encode(pdf_content).decode("utf-8")
 
     raise ValueError(f"PDF not found: {pdf_id}")
+
 
 @server.list_prompts()
 async def handle_list_prompts() -> list[types.Prompt]:
@@ -73,7 +94,7 @@ async def handle_list_prompts() -> list[types.Prompt]:
                     name="style",
                     description="Style of the summary (brief/detailed)",
                     required=False,
-                )
+                ),
             ],
         ),
         types.Prompt(
@@ -99,7 +120,7 @@ async def handle_list_prompts() -> list[types.Prompt]:
                     name="end_page",
                     description="End page for range extraction (inclusive)",
                     required=False,
-                )
+                ),
             ],
         ),
         types.Prompt(
@@ -120,15 +141,14 @@ async def handle_list_prompts() -> list[types.Prompt]:
                     name="page_range",
                     description="Optional specific page range to focus on (format: '0-5')",
                     required=False,
-                )
+                ),
             ],
-        )
+        ),
     ]
 
+
 @server.get_prompt()
-async def handle_get_prompt(
-    name: str, arguments: dict[str, str] | None
-) -> types.GetPromptResult:
+async def handle_get_prompt(name: str, arguments: dict[str, str] | None) -> types.GetPromptResult:
     """
     Generate a prompt by combining arguments with server state.
     The prompt extracts text from the PDF and can be customized via arguments.
@@ -140,7 +160,7 @@ async def handle_get_prompt(
     if pdf_id not in pdfs:
         raise ValueError(f"PDF not found: {pdf_id}")
 
-    pdf_reader = pdfs[pdf_id]
+    doc = pdfs[pdf_id]
     pdf_path = pdf_paths[pdf_id]
     pdf_name = Path(pdf_path).name
 
@@ -150,21 +170,20 @@ async def handle_get_prompt(
 
         # Extract text from all pages for summarization
         text_content = ""
-        total_pages = len(pdf_reader.pages)
+        total_pages = doc.page_count()
 
         # Get PDF metadata for better context
-        metadata = pdf_reader.metadata
+        metadata = _get_metadata(doc)
         metadata_text = ""
         if metadata:
             metadata_text = "\nDocument Metadata:\n" + "\n".join([f"- {k}: {v}" for k, v in metadata.items()])
 
         # Create a structured summary of the content with page numbers
         for page_num in range(total_pages):
-            page = pdf_reader.pages[page_num]
-            page_text = page.extract_text()
+            page_text = doc.extract_text(page_num)
             if page_text:
                 # Format the text to be easier to read
-                page_text = page_text.replace('\n\n', '\n').strip()
+                page_text = page_text.replace("\n\n", "\n").strip()
                 text_content += f"\n--- PAGE {page_num + 1}/{total_pages} ---\n{page_text}\n"
 
         # Instructions for the model are included in the user message since system role isn't available
@@ -196,17 +215,16 @@ async def handle_get_prompt(
         # Handle specific page or page range extraction
         if "page" in arguments:
             page_num = int(arguments["page"])
-            if page_num < 0 or page_num >= len(pdf_reader.pages):
+            if page_num < 0 or page_num >= doc.page_count():
                 raise ValueError(f"Invalid page number: {page_num}")
 
-            page = pdf_reader.pages[page_num]
-            page_text = page.extract_text() or f"No text found on page {page_num}"
+            page_text = doc.extract_text(page_num) or f"No text found on page {page_num}"
 
             # Format the text for better readability
-            page_text = page_text.replace('\n\n', '\n').strip()
+            page_text = page_text.replace("\n\n", "\n").strip()
 
             # Add metadata about the document for context
-            metadata = pdf_reader.metadata
+            metadata = _get_metadata(doc)
             metadata_text = ""
             if metadata:
                 metadata_text = "\nDocument Metadata:\n" + "\n".join([f"- {k}: {v}" for k, v in metadata.items() if v])
@@ -220,7 +238,7 @@ async def handle_get_prompt(
                             type="text",
                             text=(
                                 f"# PDF Text Extraction\n\n"
-                                f"Below is the text extracted from page {page_num + 1} (of {len(pdf_reader.pages)}) of the PDF document titled '{pdf_name}'."
+                                f"Below is the text extracted from page {page_num + 1} (of {doc.page_count()}) of the PDF document titled '{pdf_name}'."
                                 f"{metadata_text}\n\n"
                                 f"```\n{page_text}\n```\n\n"
                                 f"Please work with this text to answer any questions, summarize, or analyze as needed."
@@ -232,22 +250,21 @@ async def handle_get_prompt(
         else:
             # Handle page range
             start_page = int(arguments.get("start_page", "0"))
-            end_page = int(arguments.get("end_page", str(len(pdf_reader.pages) - 1)))
+            end_page = int(arguments.get("end_page", str(doc.page_count() - 1)))
 
-            if start_page < 0 or end_page >= len(pdf_reader.pages) or start_page > end_page:
+            if start_page < 0 or end_page >= doc.page_count() or start_page > end_page:
                 raise ValueError(f"Invalid page range: {start_page}-{end_page}")
 
             text_content = ""
             for page_num in range(start_page, end_page + 1):
-                page = pdf_reader.pages[page_num]
-                page_text = page.extract_text()
+                page_text = doc.extract_text(page_num)
                 if page_text:
                     # Format the text for better readability
-                    page_text = page_text.replace('\n\n', '\n').strip()
-                    text_content += f"\n--- PAGE {page_num + 1}/{len(pdf_reader.pages)} ---\n{page_text}\n"
+                    page_text = page_text.replace("\n\n", "\n").strip()
+                    text_content += f"\n--- PAGE {page_num + 1}/{doc.page_count()} ---\n{page_text}\n"
 
             # Add metadata about the document for context
-            metadata = pdf_reader.metadata
+            metadata = _get_metadata(doc)
             metadata_text = ""
             if metadata:
                 metadata_text = "\nDocument Metadata:\n" + "\n".join([f"- {k}: {v}" for k, v in metadata.items() if v])
@@ -261,7 +278,7 @@ async def handle_get_prompt(
                             type="text",
                             text=(
                                 f"# PDF Text Extraction\n\n"
-                                f"Below is the text extracted from pages {start_page + 1}-{end_page + 1} (of {len(pdf_reader.pages)}) of the PDF document titled '{pdf_name}'."
+                                f"Below is the text extracted from pages {start_page + 1}-{end_page + 1} (of {doc.page_count()}) of the PDF document titled '{pdf_name}'."
                                 f"{metadata_text}\n\n"
                                 f"```\n{text_content}\n```\n\n"
                                 f"Please work with this text to answer any questions, summarize, or analyze as needed."
@@ -278,7 +295,7 @@ async def handle_get_prompt(
 
         # Extract text based on specified page range or use all pages
         page_range = arguments.get("page_range", "")
-        total_pages = len(pdf_reader.pages)
+        total_pages = doc.page_count()
 
         start_page = 0
         end_page = total_pages - 1
@@ -300,15 +317,14 @@ async def handle_get_prompt(
         # Extract text from the specified pages
         text_content = ""
         for page_num in range(start_page, end_page + 1):
-            page = pdf_reader.pages[page_num]
-            page_text = page.extract_text()
+            page_text = doc.extract_text(page_num)
             if page_text:
                 # Format the text for better readability
-                page_text = page_text.replace('\n\n', '\n').strip()
+                page_text = page_text.replace("\n\n", "\n").strip()
                 text_content += f"\n--- PAGE {page_num + 1}/{total_pages} ---\n{page_text}\n"
 
         # Add metadata for context
-        metadata = pdf_reader.metadata
+        metadata = _get_metadata(doc)
         metadata_text = ""
         if metadata:
             metadata_text = "\nDocument Metadata:\n" + "\n".join([f"- {k}: {v}" for k, v in metadata.items() if v])
@@ -340,6 +356,7 @@ async def handle_get_prompt(
 
     else:
         raise ValueError(f"Unknown prompt: {name}")
+
 
 @server.list_tools()
 async def handle_list_tools() -> list[types.Tool]:
@@ -411,14 +428,19 @@ async def handle_list_tools() -> list[types.Tool]:
                 "type": "object",
                 "properties": {
                     "pdf_id": {"type": "string", "description": "ID of the PDF to extract text from"},
-                    "include_page_numbers": {"type": "boolean", "description": "Whether to include page number markers in the output", "default": True},
+                    "include_page_numbers": {
+                        "type": "boolean",
+                        "description": "Whether to include page number markers in the output",
+                        "default": True,
+                    },
                     "start_page": {"type": "integer", "description": "Start page number (0-based, inclusive)"},
                     "end_page": {"type": "integer", "description": "End page number (0-based, inclusive)"},
                 },
                 "required": ["pdf_id"],
             },
-        )
+        ),
     ]
+
 
 @server.call_tool()
 async def handle_call_tool(
@@ -442,13 +464,13 @@ async def handle_call_tool(
 
         try:
             # Try to open as PDF
-            reader = PyPDF2.PdfReader(path)
+            doc = PdfDocument(path)
 
             # Generate a unique ID
             pdf_id = base64.urlsafe_b64encode(os.path.abspath(path).encode()).decode()[:12]
 
-            # Store the reader and path
-            pdfs[pdf_id] = reader
+            # Store the document and path
+            pdfs[pdf_id] = doc
             pdf_paths[pdf_id] = path
 
             # Notify clients that resources have changed
@@ -457,7 +479,7 @@ async def handle_call_tool(
             return [
                 types.TextContent(
                     type="text",
-                    text=f"Opened PDF '{os.path.basename(path)}' with {len(reader.pages)} pages. PDF ID: {pdf_id}",
+                    text=f"Opened PDF '{os.path.basename(path)}' with {doc.page_count()} pages. PDF ID: {pdf_id}",
                 )
             ]
         except Exception as e:
@@ -489,8 +511,8 @@ async def handle_call_tool(
         if not pdf_id or pdf_id not in pdfs:
             raise ValueError("Invalid PDF ID")
 
-        reader = pdfs[pdf_id]
-        metadata = reader.metadata
+        doc = pdfs[pdf_id]
+        metadata = _get_metadata(doc)
 
         if metadata:
             metadata_text = "\n".join([f"{k}: {v}" for k, v in metadata.items()])
@@ -509,12 +531,12 @@ async def handle_call_tool(
         if not pdf_id or pdf_id not in pdfs:
             raise ValueError("Invalid PDF ID")
 
-        reader = pdfs[pdf_id]
+        doc = pdfs[pdf_id]
 
         return [
             types.TextContent(
                 type="text",
-                text=f"'{os.path.basename(pdf_paths[pdf_id])}' has {len(reader.pages)} pages",
+                text=f"'{os.path.basename(pdf_paths[pdf_id])}' has {doc.page_count()} pages",
             )
         ]
 
@@ -527,15 +549,14 @@ async def handle_call_tool(
         if page_number is None:
             raise ValueError("Missing page number")
 
-        reader = pdfs[pdf_id]
+        doc = pdfs[pdf_id]
 
         # Check if page number is valid
-        if page_number < 0 or page_number >= len(reader.pages):
-            raise ValueError(f"Invalid page number. PDF has {len(reader.pages)} pages (0-{len(reader.pages)-1})")
+        if page_number < 0 or page_number >= doc.page_count():
+            raise ValueError(f"Invalid page number. PDF has {doc.page_count()} pages (0-{doc.page_count() - 1})")
 
         # Extract text from the specified page
-        page = reader.pages[page_number]
-        page_text = page.extract_text()
+        page_text = doc.extract_text(page_number)
 
         if not page_text:
             page_text = f"No extractable text found on page {page_number}"
@@ -552,32 +573,31 @@ async def handle_call_tool(
         if not pdf_id or pdf_id not in pdfs:
             raise ValueError("Invalid PDF ID")
 
-        reader = pdfs[pdf_id]
+        doc = pdfs[pdf_id]
         include_page_numbers = arguments.get("include_page_numbers", True)
 
         # Get page range or use all pages
         start_page = arguments.get("start_page", 0)
-        end_page = arguments.get("end_page", len(reader.pages) - 1)
+        end_page = arguments.get("end_page", doc.page_count() - 1)
 
         # Validate page range
-        if start_page < 0 or start_page >= len(reader.pages):
+        if start_page < 0 or start_page >= doc.page_count():
             start_page = 0
-        if end_page < 0 or end_page >= len(reader.pages):
-            end_page = len(reader.pages) - 1
+        if end_page < 0 or end_page >= doc.page_count():
+            end_page = doc.page_count() - 1
         if start_page > end_page:
             start_page, end_page = end_page, start_page
 
         # Extract text from all pages
         all_text = []
-        total_pages = len(reader.pages)
+        total_pages = doc.page_count()
 
         for page_num in range(start_page, end_page + 1):
-            page = reader.pages[page_num]
-            page_text = page.extract_text()
+            page_text = doc.extract_text(page_num)
 
             if page_text:
                 # Format the text to be easier to read
-                page_text = page_text.replace('\n\n', '\n').strip()
+                page_text = page_text.replace("\n\n", "\n").strip()
 
                 if include_page_numbers:
                     all_text.append(f"\n--- PAGE {page_num + 1}/{total_pages} ---\n{page_text}")
@@ -590,7 +610,7 @@ async def handle_call_tool(
         full_text = "\n".join(all_text)
 
         # Get PDF metadata for context
-        metadata = reader.metadata
+        metadata = _get_metadata(doc)
         metadata_text = ""
         if metadata:
             metadata_text = "\nDocument Metadata:\n" + "\n".join([f"- {k}: {v}" for k, v in metadata.items() if v])
@@ -616,6 +636,7 @@ async def handle_call_tool(
     else:
         raise ValueError(f"Unknown tool: {name}")
 
+
 async def main():
     # Run the server using stdin/stdout streams
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
@@ -631,6 +652,7 @@ async def main():
                 ),
             ),
         )
+
 
 if __name__ == "__main__":
     asyncio.run(main())

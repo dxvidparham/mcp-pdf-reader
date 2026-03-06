@@ -6,6 +6,8 @@
 
 An MCP server that enables VS Code to view and analyze PDF documents using the Model Context Protocol (MCP).
 
+This is a fork of [pietermyb/mcp-pdf-reader](https://github.com/pietermyb/mcp-pdf-reader) with the PDF backend replaced from PyPDF2 to [pdf_oxide](https://github.com/yfedoseev/pdf_oxide) — a Rust-based PDF library that is significantly faster (5x faster than PyMuPDF, 15x faster than pypdf) and more reliable (100% pass rate on 3,830 test PDFs).
+
 This project was created using the [Model Context Protocol Python SDK](https://github.com/modelcontextprotocol/python-sdk) based on FastMCP.
 
 ## Features
@@ -132,7 +134,7 @@ To make changes to this project:
 ## Requirements
 
 - Python 3.13+
-- PyPDF2 3.0.0+
+- [pdf_oxide](https://github.com/yfedoseev/pdf_oxide) 0.3.0+
 - MCP SDK 1.9.0+ (from [github.com/modelcontextprotocol/python-sdk](https://github.com/modelcontextprotocol/python-sdk))
 - VS Code with MCP extension
 
